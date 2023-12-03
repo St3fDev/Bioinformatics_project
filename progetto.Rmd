@@ -1,0 +1,353 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+Il primo step sarà quello di installare tutti i pacchetti necessari:
+
+```{r}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("curatedTCGAData")
+BiocManager::install("TCGAutils")
+BiocManager::install("TCGAbiolinks")
+install.packages("SNFtool")
+install.packages("NetPreProc")
+install.packages("caret");
+install.packages("cluster");
+install.packages("mclustcomp");
+```
+
+quindi carico le librerie:
+
+```{r message=FALSE, warning=FALSE}
+library("curatedTCGAData");
+library("TCGAbiolinks");
+library("TCGAutils");
+library("SNFtool");
+library("NetPreProc");
+library("caret");
+library("cluster"); #pam
+library("mclustcomp");
+```
+
+A questo punto per ottenere il dataset del carcinoma prostatico (PRAD) contenente informazioni su espressione genica a livello di mRNA, espressione di microRNA e espressione proteica, ho seguito il seguente processo:
+
+```{r message=TRUE}
+# ho specificato le omiche di interesse richieste dal progetto
+assays <- c("miRNASeqGene", "RNASeq2Gene", "RPPAArray");
+
+# ottengo i dati per il dataset del carcinoma prostatico
+mo <- curatedTCGAData(diseaseCode = "PRAD", 
+                        assays = assays, 
+                        version = "2.0.1", dry.run = FALSE);
+mo
+```
+
+Fase 2: Data pre-processing
+Ogni campione è identificato da un barcode con una specifica struttura:
+  - i primi 12 caratteri identificano uno specifico individuo 
+  - le altre parti ci danno indicazioni sul tipo di campione (primario, metastatico, solido, derivato dal sangue, ecc.), sul tipo di materiale genomico estratto (DNA, RNA) e altre informazioni relative alle repliche tecniche (cioè misurazioni ripetute dallo stesso campione).
+
+Usiamo il barcode per:
+  - conservare solo i tumori solidi primari per avere un gruppo di campioni più omogeno. Questo è identificato dal codice "01" nella parte "sample" del barcode
+  - Rimuovere eventuali duplicati rappresentati da campioni che hanno gli stessi 12 caratteri iniziali
+```{r}
+# Considerare solo i tumori solidi primari:
+primary <- TCGAutils::TCGAsampleSelect(colnames(mo), c("01"))
+mo <- mo[, primary, ]
+
+# Controllo delle repliche 
+check_rep <- anyReplicated(mo)
+print(check_rep)
+```
+```{r}
+# The information regarding if the sample is FFPE is stored in the clinical data,
+# which are accessible using colData().  
+no_ffpe <- which(as.data.frame(colData(mo))$patient.samples.sample.is_ffpe == "no");
+mo <- mo[, no_ffpe, ];
+
+# Obtain samples having all the considered omics:
+complete <- intersectColumns(mo);
+# Extract assays in list:
+complete <- assays(complete);
+# Obtain matrices samples x features:
+complete <- lapply(complete, FUN=t)
+#colnames(complete[[2]])
+```
+
+
+
+```{r}
+# Verifica se ci sono valori nulli in ciascuna colonna di un dataframe
+for (i in 1:length(complete)){
+  print(paste(names(complete)[i], ":", any(colSums(is.na(complete[[i]])) > 0)))
+}
+
+# Remove features having NAs (present only in proteomics data):
+complete[[3]] <- complete[[3]][, colSums(is.na(complete[[3]])) == 0];
+
+# Remove features with near zero variance and retain top 500 features 
+# having higher variance:
+nf <- 100;
+for(i in 1:length(complete)){
+    
+    idx <- caret::nearZeroVar(complete[[i]])
+    message(paste("Removed ", length(idx), "features from", names(complete)[i]));
+    if(length(idx) != 0){
+        complete[[i]] <- complete[[i]][, -idx];
+    }
+
+    if(ncol(complete[[i]]) <= nf) next
+    
+    vars <- apply(complete[[i]], 2, var);
+    idx <- sort(vars, index.return=TRUE, decreasing = TRUE)$ix;
+    
+    complete[[i]] <- complete[[i]][, idx[1:nf]];
+    
+}
+
+# Perform features standardization using z-score:
+zscore <- function(data){
+    
+    zscore_vec <- function(x) { return ((x - mean(x)) / sd(x))}
+    data <- apply(data, 2, zscore_vec)
+    
+    
+    return(data)
+}
+complete <- lapply(complete, zscore);
+
+# Clean barcodes retaining only "Project-TSS-Participant":
+for(v in 1:length(complete)){
+    rownames(complete[[v]]) <- substr(rownames(complete[[v]]), 1, 12);
+}
+```
+
+PUNTO 3:
+```{r}
+# Download disease subtypes from TCGAbiolinks:
+as.data.frame(complete[["PRAD_miRNASeqGene-20160128"]])
+subtypes <- as.data.frame(TCGAbiolinks::PanCancerAtlas_subtypes());
+subtypes <- subtypes[subtypes$cancer.type == "PRAD", ];
+
+# Retain only primary solid tumors and select samples in common with omics data
+# (in the same order):
+subtypes <- subtypes[TCGAutils::TCGAsampleSelect(subtypes$pan.samplesID, "01"), ];
+sub_select <- substr(subtypes$pan.samplesID,1,12) %in% rownames(complete[[1]]);
+subtypes <- subtypes[sub_select, ];
+rownames(subtypes) <- substr(subtypes$pan.samplesID, 1, 12);
+subtypes <- subtypes[rownames(complete[[1]]),];
+
+# Print number of samples for each subtype:
+table(subtypes$Subtype_Integrative);
+
+# Rimuovi le righe con NA nella colonna pan.samplesID
+subtypes <- subtypes[!is.na(subtypes$pan.samplesID), ]
+
+for (i in 1:length(complete)) {
+# Seleziona solo le righe di complete[[i]] corrispondenti a pazienti in subtypes
+complete[[i]] <- complete[[i]][rownames(complete[[i]]) %in% rownames(subtypes), ]
+}
+
+#as.data.frame(subtypes)
+#as.data.frame(complete[[1]])
+```
+
+```{r}
+# Verifica che i pazienti nei dataset multi-omics e nelle sottocategorie siano nello stesso ordine
+#matching_order <- all(!is.na(match(rownames(complete[[1]]), substr(subtypes$pan.samplesID, 1, 12))))
+
+#if (matching_order) {
+#  cat("I pazienti nei dataset multi-omics e nelle sottocategorie sono nello stesso ordine.\n")
+#} else {
+#  cat("ATTENZIONE: I pazienti nei dataset multi-omics e nelle sottocategorie NON sono nello stesso ordine.\n")
+#}
+```
+
+
+PUNTO 4:
+```{r}
+# Verifica che i pazienti nei dataset multi-omics e nelle sottocategorie siano nello stesso ordine per tutti gli omici
+matching_order <- TRUE
+
+for (i in 1:length(complete)) {
+  matching_order <- matching_order & !is.na(match(rownames(complete[[i]]), substr(subtypes$pan.samplesID, 1, 12)))
+}
+
+if (all(matching_order)) {
+  cat("I pazienti nei dataset multi-omics e nelle sottocategorie sono nello stesso ordine dopo il riordinamento.\n")
+} else {
+  cat("ATTENZIONE: I pazienti nei dataset multi-omics e nelle sottocategorie NON sono nello stesso ordine.\n")
+}
+```
+
+PUNTO 5:
+```{r}
+K = 20; # Number of neighbors
+T = 20; # Number of iterations
+
+# Compute similarity matrix for each data source using the scaled
+# exponential euclidean distance:
+W_list <- list();
+for(i in 1:length(complete)){
+    Dist <- (dist2(as.matrix(complete[[i]]), as.matrix(complete[[i]])))^(1/2);
+    W_list[[i]] <- affinityMatrix(Dist);
+}
+    
+# Integration of multi-omics data using Similarity Network Fusion:
+# t is the number of iterations and K is the number of neighbors to 
+# consider to compute the local similarity matrix:
+W_int <- SNF(W_list, K, T)
+
+```
+
+
+PUNTO 6: 
+```{r}
+# Calcolo della media delle matrici di similarità
+W_average <- Reduce(`+`, W_list) / length(W_list)
+```
+
+
+PUNTO 8a:
+```{r}
+# b. Normalizza le matrici di similarità
+for (i in 1:length(W_list)) {
+    W_list[[i]] <- NetPreProc::Max.Min.norm(W_list[[i]])
+}
+
+# c. Converti le matrici di similarità normalizzate in matrici di distanza
+D_list_single <- lapply(W_list, function(W) 1 - NetPreProc::Max.Min.norm(W))
+
+# Esegui PAM sugli insiemi di dati integrati
+k <- length(unique(subtypes$Subtype_Integrative))
+
+# PAM per miRNA
+pam_res_miRNA <- pam(as.dist(D_list_single[[1]]), k = k)
+
+# PAM per mRNA
+pam_res_mRNA <- pam(as.dist(D_list_single[[2]]), k = k)
+
+# PAM per proteine
+pam_res_proteins <- pam(as.dist(D_list_single[[3]]), k = k)
+```
+
+
+PUNTO 8b:
+```{r}
+# Normalizza la matrice di similarità
+W_avg_norm <- NetPreProc::Max.Min.norm(W_average)
+
+# Calcola la matrice di distanza
+D_avg <- as.dist(1 - W_avg_norm)
+
+# Esegui PAM sulla matrice integrata ottenuta dalla media
+pam_res_avg <- pam(D_avg, k = k)
+```
+
+
+PUNTO 8C:
+```{r}
+# Normalizza la matrice di similarità fusionata
+W_int_norm <- NetPreProc::Max.Min.norm(W_int)
+
+# Calcola la matrice di distanza
+D_int <- as.dist(1 - W_int_norm)
+
+# Applica PAM sull'insieme di dati integrato tramite Similarity Network Fusion
+pam_res_snf <- pam(D_int, k = k)
+```
+
+
+PUNTO 10 (Opzionale):
+```{r}
+# Esegui il clustering spettrale
+# k <- length(unique(subtypes$Subtype_Integrative))
+spectral_clustering <- spectralClustering(W_int, k)
+str(spectral_clustering)
+# Visualizza i risultati
+table(spectral_clustering)
+```
+
+
+```{r}
+# Creare una lista con i risultati di clustering
+clustering_results <- list(
+  PAM_miRNA = pam_res_miRNA$clustering,
+  PAM_mRNA = pam_res_mRNA$clustering,
+  PAM_proteins = pam_res_proteins$clustering,
+  PAM_Avg = pam_res_avg$clustering,
+  PAM_SNF = pam_res_snf$clustering,
+  Spectral_Clustering = spectral_clustering
+)
+
+# Allineare le lunghezze dei vettori
+max_length <- max(sapply(clustering_results, length))
+clustering_results <- lapply(clustering_results, function(x) c(x, rep(NA, max_length - length(x))))
+
+# Creare un dataframe con i risultati di clustering
+comparison_table <- data.frame(clustering_results)
+
+# Creare un dataframe con i sottotipi di malattie iCluster
+iCluster_subtypes <- data.frame(Subtype_Integrative = subtypes$Subtype_Integrative)
+
+# Creare un dataframe finale
+final_df <- cbind(iCluster_subtypes, comparison_table)
+
+# Creare una tabella di contingenza per ciascun risultato di clustering rispetto ai sottotipi di malattie iCluster
+for (name in names(clustering_results)) {
+  print(paste("Contingency table for", name))
+  print(table(iCluster_subtypes$Subtype_Integrative, final_df[[name]]))
+}
+
+# Calcolare l'indice di Rand Adjusted per ciascun risultato di clustering rispetto ai sottotipi di malattie iCluster
+for (name in names(clustering_results)) {
+  print(paste("Adjusted Rand index for", name))
+  print(cluster::adjustedRandIndex(iCluster_subtypes$Subtype_Integrative, final_df[[name]]))
+}
+
+# Creare un grafico a barre per ciascun risultato di clustering
+par(mfrow = c(2, 3))  # Impostare il layout del grafico
+for (name in names(clustering_results)) {
+  barplot(table(final_df[[name]]), main = name, xlab = "Cluster", ylab = "Count")
+}
+
+```
+
+
+
+PUNTO 11:
+```{r}
+# Creare una tabella di confronto con nomi descrittivi per gli approcci
+comparison_table <- data.frame(
+  Method = c("PAM_miRNA", "PAM_mRNA", "PAM_proteins", "PAM_Avg", "PAM_SNF", "Spectral_Clustering"),
+  Cluster_Assignment = c(
+    pam_res_miRNA$clustering, 
+    pam_res_mRNA$clustering, 
+    pam_res_proteins$clustering, 
+    pam_res_avg$clustering, 
+    pam_res_snf$clustering, 
+    spectral_clustering
+  )
+)
+
+# Visualizzare la tabella
+print(comparison_table)
+```
+
+```{r}
+# Creare un grafico a barre per confrontare i cluster
+barplot(
+  table(comparison_table$Method, comparison_table$Cluster_Assignment),
+  beside = TRUE,
+  col = c("blue", "red", "green", "orange", "purple", "pink"),
+  legend.text = TRUE,
+  args.legend =  list(x = "topright", bty = "n"),  # Posiziona la legenda in alto a destra senza box
+  main = "Confronto dei clustering",
+  xlab = "Metodo",
+  ylab = "Frequenza"
+)
+```
+
